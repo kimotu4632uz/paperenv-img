@@ -2,7 +2,6 @@ name: Build & Push Devcontainer Image with Tags
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
 
 permissions:
