@@ -1,4 +1,5 @@
-FROM paperist/texlive-ja:2023-debian
+ARG TEXLIVE_YEAR=latest
+FROM paperist/texlive-ja:${TEXLIVE_YEAR}-debian
 
 RUN --mount=type=bind,source=tlmgr-packages.txt,target=/tmp/tlmgr-packages.txt,ro \
     set -eux; \

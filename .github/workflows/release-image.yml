@@ -9,18 +9,100 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      years: ${{ steps.versions.outputs.years }}
+      latest_year: ${{ steps.versions.outputs.latest_year }}
+      latest_target: ${{ steps.versions.outputs.latest_target }}
+      tag_year: ${{ steps.tag.outputs.tag_year }}
+      tag_rev: ${{ steps.tag.outputs.tag_rev }}
+      short_sha: ${{ steps.vars.outputs.short_sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive tags
-        id: vars
+      - name: Parse tag
+        id: tag
         shell: bash
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG_NAME" =~ ^v([0-9]{4})\.([0-9]+)$ ]]; then
+            echo "tag_year=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "tag_rev=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Invalid tag format: $TAG_NAME (expected vYYYY.N)" >&2
+            exit 1
+          fi
+
+      - name: Read versions
+        id: versions
+        shell: bash
+        run: |
+          TAG_YEAR="${{ steps.tag.outputs.tag_year }}" python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path("versions.txt")
+          try:
+              text = path.read_text(encoding="utf-8")
+          except FileNotFoundError:
+              print("versions.txt not found", file=sys.stderr)
+              sys.exit(1)
+
+          years = []
+          has_latest = False
+          for line in text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line == "latest":
+                  has_latest = True
+                  continue
+              if not re.fullmatch(r"\d{4}", line):
+                  print(f"Invalid year in versions.txt: {line}", file=sys.stderr)
+                  sys.exit(1)
+              years.append(line)
+
+          years = sorted(set(years), key=int)
+          if not years:
+              print("versions.txt has no years", file=sys.stderr)
+              sys.exit(1)
+
+          tag_year = os.environ.get("TAG_YEAR")
+          if tag_year and tag_year not in years:
+              print(f"Tag year {tag_year} is not listed in versions.txt", file=sys.stderr)
+              sys.exit(1)
+
+          latest_year = years[-1]
+          matrix_years = years[:]
+          if has_latest:
+              matrix_years.append("latest")
+              latest_target = "latest"
+          else:
+              latest_target = latest_year
+
+          print(f"years={json.dumps(matrix_years)}")
+          print(f"latest_year={latest_year}")
+          print(f"latest_target={latest_target}")
+          PY >> "$GITHUB_OUTPUT"
+
+      - name: Derive short sha
+        id: vars
+        shell: bash
+        run: |
           echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        year: ${{ fromJSON(needs.prepare.outputs.years) }}
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -29,13 +111,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compose image tags
+        id: tags
+        shell: bash
+        run: |
+          tags=()
+          add_tag() {
+            local t="$1"
+            for existing in "${tags[@]}"; do
+              if [[ "$existing" == "$t" ]]; then
+                return 0
+              fi
+            done
+            tags+=("$t")
+          }
+
+          add_tag "${{ matrix.year }}"
+          if [[ "${{ matrix.year }}" == "${{ needs.prepare.outputs.tag_year }}" ]]; then
+            add_tag "${{ needs.prepare.outputs.tag_year }}-${{ needs.prepare.outputs.tag_rev }}"
+          fi
+          if [[ "${{ matrix.year }}" == "${{ needs.prepare.outputs.latest_target }}" ]]; then
+            add_tag "latest"
+            add_tag "sha-${{ needs.prepare.outputs.short_sha }}"
+          fi
+
+          {
+            echo "image_tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push devcontainer image
         uses: devcontainers/ci@v0.3
         with:
           imageName: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
-          imageTag: |
-            ${{ steps.vars.outputs.tag_name }},
-            latest,
-            sha-${{ steps.vars.outputs.short_sha }}
+          imageTag: ${{ steps.tags.outputs.image_tags }}
           push: always
           cacheFrom: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest
+          buildArgs: TEXLIVE_YEAR=${{ matrix.year }}
